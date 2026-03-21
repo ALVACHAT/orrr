@@ -1,0 +1,478 @@
+// This Pine Script™ is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// © ORB 5m Strategy - Prosta Wersja (konwersja z Python)
+//
+// Logika:
+// 1. Opening Range = pierwsza świeca 5m NY (9:30-9:35 ET)
+// 2. Breakout: cena przebija OR High/Low + 0.5 × OR Height
+// 3. Pullback do 0.5 equilibrium impulsu = entry
+// 4. SL na 0.786 fib, TP na -0.1 fib extension
+// 5. Trailing stop: aktywacja po 0.3R, trail 40% zysku
+// 6. Filtr: pre-market momentum (1.5h, prosty kierunek)
+// 7. Max 1 trade/dzień, NY session only
+
+//@version=5
+strategy("ORB 5m Strategy", overlay=true, default_qty_type=strategy.fixed, 
+         default_qty_value=1, process_orders_on_close=false, 
+         calc_on_every_tick=true, max_bars_back=500)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+i_orStartHour   = input.int(9, "OR Start Hour (ET)", minval=0, maxval=23, group="Session")
+i_orStartMin    = input.int(30, "OR Start Minute", minval=0, maxval=59, group="Session")
+i_orEndHour     = input.int(9, "OR End Hour (ET)", minval=0, maxval=23, group="Session")
+i_orEndMin      = input.int(35, "OR End Minute", minval=0, maxval=59, group="Session")
+i_sessEndHour   = input.int(16, "Session End Hour (ET)", minval=0, maxval=23, group="Session")
+i_sessEndMin    = input.int(0, "Session End Minute", minval=0, maxval=59, group="Session")
+i_timezone       = input.string("America/New_York", "Timezone", group="Session")
+
+i_pmLookbackMin = input.int(90, "Pre-Market Lookback (min)", minval=10, maxval=300, group="Momentum Filter")
+i_momentumThresh = input.float(0.2, "Momentum Threshold", minval=0.0, maxval=1.0, step=0.05, group="Momentum Filter")
+
+i_boMultiplier  = input.float(0.5, "Breakout Offset (× OR Height)", minval=0.0, maxval=2.0, step=0.1, group="Breakout")
+i_orMinHeight   = input.float(5.0, "Min OR Height", minval=0, group="Breakout")
+i_orMaxHeight   = input.float(200.0, "Max OR Height", minval=1, group="Breakout")
+
+i_entryFib      = input.float(0.5, "Entry Fib Level (Equilibrium)", minval=0.0, maxval=1.0, step=0.05, group="Fib Levels")
+i_slFib         = input.float(0.786, "SL Fib Level", minval=0.0, maxval=1.0, step=0.01, group="Fib Levels")
+i_tpFib         = input.float(-0.1, "TP Fib Extension", minval=-1.0, maxval=0.5, step=0.05, group="Fib Levels")
+
+i_trailActRR    = input.float(0.3, "Trail Activation (R multiple)", minval=0.1, maxval=3.0, step=0.1, group="Trailing Stop")
+i_trailDistMult = input.float(0.4, "Trail Distance (% of profit)", minval=0.1, maxval=0.9, step=0.05, group="Trailing Stop")
+
+i_impulseLookback = input.int(60, "Max Impulse Lookback Bars", minval=5, maxval=200, group="Impulse")
+i_impulseRetrace  = input.float(0.3, "Impulse Retrace Threshold", minval=0.1, maxval=0.8, step=0.05, group="Impulse")
+
+i_showOR        = input.bool(true, "Show OR Range", group="Display")
+i_showLevels    = input.bool(true, "Show Entry/SL/TP Levels", group="Display")
+i_showArrows    = input.bool(true, "Show Entry/Exit Arrows", group="Display")
+i_showTrailLine = input.bool(true, "Show Trailing Stop Line", group="Display")
+i_showBreakout  = input.bool(false, "Show Breakout Levels", group="Display")
+i_showBias      = input.bool(false, "Show Bias Label", group="Display")
+i_showTable     = input.bool(false, "Show Info Table", group="Display")
+
+// =============================================================================
+// TIME FUNCTIONS
+// =============================================================================
+etHour  = hour(time, i_timezone)
+etMin   = minute(time, i_timezone)
+etDay   = dayofweek(time, i_timezone)
+etMinOfDay = etHour * 60 + etMin
+
+orStartMinOfDay = i_orStartHour * 60 + i_orStartMin
+orEndMinOfDay   = i_orEndHour * 60 + i_orEndMin
+sessEndMinOfDay = i_sessEndHour * 60 + i_sessEndMin
+pmStartMinOfDay = orStartMinOfDay - i_pmLookbackMin
+
+isORBar       = etMinOfDay >= orStartMinOfDay and etMinOfDay < orEndMinOfDay
+isAfterOR     = etMinOfDay >= orEndMinOfDay and etMinOfDay <= sessEndMinOfDay
+isSessionEnd  = etMinOfDay >= sessEndMinOfDay
+isPMBar       = etMinOfDay >= pmStartMinOfDay and etMinOfDay < orStartMinOfDay
+
+// Detect new trading day (when OR starts)
+isNewDay = isORBar and not isORBar[1]
+
+// =============================================================================
+// STATE VARIABLES (persist across bars)
+// =============================================================================
+
+// Opening Range tracking
+var float orHigh    = na
+var float orLow     = na
+var float orHeight  = na
+var bool  orDone    = false
+var float sessionOpen = na
+
+// Pre-market momentum
+var float pmOpenPrice  = na
+var float pmClosePrice = na
+var float pmHighest    = na
+var float pmLowest     = na
+var int   pmBarCount   = 0
+var int   bias         = 0   // 1=bull, -1=bear, 0=neutral
+
+// Breakout tracking
+var float bullLevel = na
+var float bearLevel = na
+var bool  breakoutDetected = false
+var int   breakoutDir = 0  // 1=long, -1=short
+
+// Impulse tracking
+var float impHigh     = na
+var float impLow      = na
+var int   peakIdx     = 0
+var int   troughIdx   = 0
+var int   barsAfterBO = 0
+var bool  impulseDone = false
+
+// Entry/SL/TP levels
+var float entryLevel  = na
+var float slLevel     = na
+var float tpLevel     = na
+var float riskAmount  = na
+
+// Entry search
+var bool  waitingForEntry = false
+var bool  tradeEnteredToday = false
+var bool  slBeforeEntry = false
+
+// Trailing stop
+var bool  trailActive   = false
+var float trailSL       = na
+var float bestPrice     = na
+
+// For plotting: track the current effective SL (original or trailing)
+var float currentSLplot = na
+var bool  justEntered   = false
+var bool  justExited    = false
+var int   exitDir       = 0    // 1=was long, -1=was short
+var float exitPrice     = na
+var string exitReason   = ""
+
+// =============================================================================
+// NEW DAY RESET
+// =============================================================================
+if isNewDay
+    orHigh    := high
+    orLow     := low
+    orHeight  := na
+    orDone    := false
+    sessionOpen := open
+
+    pmOpenPrice  := na
+    pmClosePrice := na
+    pmHighest    := na
+    pmLowest     := na
+    pmBarCount   := 0
+    bias         := 0
+
+    bullLevel := na
+    bearLevel := na
+    breakoutDetected := false
+    breakoutDir := 0
+
+    impHigh     := na
+    impLow      := na
+    peakIdx     := 0
+    troughIdx   := 0
+    barsAfterBO := 0
+    impulseDone := false
+
+    entryLevel  := na
+    slLevel     := na
+    tpLevel     := na
+    riskAmount  := na
+
+    waitingForEntry := false
+    tradeEnteredToday := false
+    slBeforeEntry := false
+
+    trailActive := false
+    trailSL     := na
+    bestPrice   := na
+
+    currentSLplot := na
+    justEntered   := false
+    justExited    := false
+    exitDir       := 0
+    exitPrice     := na
+    exitReason    := ""
+
+// =============================================================================
+// PRE-MARKET MOMENTUM (bias)
+// =============================================================================
+if isPMBar and not orDone
+    pmBarCount := pmBarCount + 1
+    if na(pmOpenPrice)
+        pmOpenPrice := open
+    pmClosePrice := close
+    pmHighest := na(pmHighest) ? high : math.max(pmHighest, high)
+    pmLowest  := na(pmLowest)  ? low  : math.min(pmLowest, low)
+
+// =============================================================================
+// OPENING RANGE CALCULATION
+// =============================================================================
+if isORBar and not orDone
+    orHigh := isNewDay ? high : math.max(orHigh, high)
+    orLow  := isNewDay ? low  : math.min(orLow, low)
+
+// Finalize OR when first bar after OR appears
+if isAfterOR and not orDone and not na(orHigh) and not na(orLow)
+    orHeight := orHigh - orLow
+
+    // OR height filter
+    if orHeight < i_orMinHeight or orHeight > i_orMaxHeight
+        orDone := true
+        // OR rejected, no further processing today
+    else
+        orDone := true
+        bullLevel := orHigh + i_boMultiplier * orHeight
+        bearLevel := orLow  - i_boMultiplier * orHeight
+
+        // Calculate momentum bias
+        if pmBarCount >= 5 and not na(pmOpenPrice) and not na(pmClosePrice)
+            pmChange = pmClosePrice - pmOpenPrice
+            pmRange  = pmHighest - pmLowest
+            if pmRange > 0
+                pmRatio = pmChange / pmRange
+                if pmRatio > i_momentumThresh
+                    bias := 1   // bull
+                else if pmRatio < -i_momentumThresh
+                    bias := -1  // bear
+                else
+                    bias := 0   // neutral
+
+// =============================================================================
+// BREAKOUT DETECTION (after OR, before entry)
+// =============================================================================
+if isAfterOR and orDone and not breakoutDetected and not tradeEnteredToday and not na(bullLevel) and not na(bearLevel)
+    if high >= bullLevel
+        breakoutDetected := true
+        breakoutDir := 1  // long
+        // Initialize impulse tracking for long
+        impLow  := sessionOpen
+        impHigh := high
+        peakIdx := 0
+        barsAfterBO := 0
+        impulseDone := false
+    else if low <= bearLevel
+        breakoutDetected := true
+        breakoutDir := -1  // short
+        // Initialize impulse tracking for short
+        impHigh := sessionOpen
+        impLow  := low
+        troughIdx := 0
+        barsAfterBO := 0
+        impulseDone := false
+
+    // Momentum filter: only trade with bias
+    if breakoutDetected
+        if bias == 1 and breakoutDir == -1
+            breakoutDetected := false
+            breakoutDir := 0
+        else if bias == -1 and breakoutDir == 1
+            breakoutDetected := false
+            breakoutDir := 0
+
+// =============================================================================
+// IMPULSE TRACKING (find peak/trough then calculate entry levels)
+// =============================================================================
+if isAfterOR and breakoutDetected and not impulseDone and not tradeEnteredToday
+    barsAfterBO := barsAfterBO + 1
+    
+    if barsAfterBO <= i_impulseLookback
+        if breakoutDir == 1  // Long - track impulse high
+            if high > impHigh
+                impHigh := high
+                peakIdx := barsAfterBO
+            else if barsAfterBO > peakIdx
+                impRange = impHigh - impLow
+                if impRange > 0 and (impHigh - low) / impRange >= i_impulseRetrace
+                    // Impulse done, calculate levels
+                    impulseDone := true
+            
+        else  // Short - track impulse low
+            if low < impLow
+                impLow := low
+                troughIdx := barsAfterBO
+            else if barsAfterBO > troughIdx
+                impRange = impHigh - impLow
+                if impRange > 0 and (high - impLow) / impRange >= i_impulseRetrace
+                    impulseDone := true
+    else
+        // Timeout - use whatever we have
+        impulseDone := true
+
+    if impulseDone
+        impRange = impHigh - impLow
+        if impRange > 0
+            if breakoutDir == 1  // Long
+                entryLevel := impHigh - i_entryFib * impRange      // 0.5 equilibrium
+                slLevel    := impHigh - i_slFib * impRange          // SL at 0.786 fib
+                tpLevel    := impHigh - i_tpFib * impRange          // TP at -0.1 extension
+                riskAmount := entryLevel - slLevel
+                if riskAmount > 0
+                    waitingForEntry := true
+                else
+                    breakoutDetected := false
+            else  // Short
+                entryLevel := impLow + i_entryFib * impRange
+                slLevel    := impLow + i_slFib * impRange
+                tpLevel    := impLow + i_tpFib * impRange
+                riskAmount := slLevel - entryLevel
+                if riskAmount > 0
+                    waitingForEntry := true
+                else
+                    breakoutDetected := false
+        else
+            breakoutDetected := false
+
+// =============================================================================
+// ENTRY LOGIC (wait for pullback to entry level)
+// =============================================================================
+// Reset per-bar flags before entry/exit logic
+justEntered := false
+justExited  := false
+
+if isAfterOR and waitingForEntry and not tradeEnteredToday
+    if breakoutDir == 1  // Long entry
+        // Check if SL hit before entry
+        if low <= slLevel
+            slBeforeEntry := true
+            waitingForEntry := false
+        else if low <= entryLevel
+            // ENTRY - go long
+            strategy.entry("Long", strategy.long, limit=entryLevel)
+            tradeEnteredToday := true
+            waitingForEntry := false
+            trailActive := false
+            trailSL := slLevel
+            bestPrice := entryLevel
+            currentSLplot := slLevel
+            justEntered := true
+    else  // Short entry
+        if high >= slLevel
+            slBeforeEntry := true
+            waitingForEntry := false
+        else if high >= entryLevel
+            // ENTRY - go short
+            strategy.entry("Short", strategy.short, limit=entryLevel)
+            tradeEnteredToday := true
+            waitingForEntry := false
+            trailActive := false
+            trailSL := slLevel
+            bestPrice := entryLevel
+            currentSLplot := slLevel
+            justEntered := true
+
+// =============================================================================
+// TRADE MANAGEMENT: Trailing Stop, SL, TP, Session End
+// =============================================================================
+if strategy.position_size != 0 and tradeEnteredToday
+    currentSL = trailActive ? trailSL : slLevel
+
+    if strategy.position_size > 0  // Long position
+        // Update trailing stop
+        if high > bestPrice
+            bestPrice := high
+        currentProfit = bestPrice - entryLevel
+        if currentProfit >= i_trailActRR * riskAmount
+            trailActive := true
+            newTrail = entryLevel + currentProfit * (1.0 - i_trailDistMult)
+            trailSL := math.max(trailSL, newTrail)
+            currentSL := trailSL
+
+        // Update plot SL
+        currentSLplot := currentSL
+
+        // Check SL (original or trailing)
+        if low <= currentSL
+            strategy.close("Long", comment=trailActive ? "Trail SL" : "SL")
+            justExited := true
+            exitDir := 1
+            exitPrice := currentSL
+            exitReason := trailActive ? "Trail SL" : "SL"
+            currentSLplot := na
+        // Check TP
+        else if high >= tpLevel
+            strategy.close("Long", comment="TP")
+            justExited := true
+            exitDir := 1
+            exitPrice := tpLevel
+            exitReason := "TP"
+            currentSLplot := na
+
+    else if strategy.position_size < 0  // Short position
+        // Update trailing stop
+        if low < bestPrice
+            bestPrice := low
+        currentProfit = entryLevel - bestPrice
+        if currentProfit >= i_trailActRR * riskAmount
+            trailActive := true
+            newTrail = entryLevel - currentProfit * (1.0 - i_trailDistMult)
+            trailSL := math.min(trailSL, newTrail)
+            currentSL := trailSL
+
+        // Update plot SL
+        currentSLplot := currentSL
+
+        // Check SL (original or trailing)
+        if high >= currentSL
+            strategy.close("Short", comment=trailActive ? "Trail SL" : "SL")
+            justExited := true
+            exitDir := -1
+            exitPrice := currentSL
+            exitReason := trailActive ? "Trail SL" : "SL"
+            currentSLplot := na
+        // Check TP
+        else if low <= tpLevel
+            strategy.close("Short", comment="TP")
+            justExited := true
+            exitDir := -1
+            exitPrice := tpLevel
+            exitReason := "TP"
+            currentSLplot := na
+
+// Session end - close any open position
+if isSessionEnd and strategy.position_size != 0
+    strategy.close_all(comment="Session End")
+    justExited := true
+    exitDir := strategy.position_size > 0 ? 1 : -1
+    exitPrice := close
+    exitReason := "Session End"
+    currentSLplot := na
+
+// =============================================================================
+// PLOTS & VISUALS (clean, minimal)
+// =============================================================================
+
+// OR Range — subtle shaded zone
+orHighPlot = plot(i_showOR and orDone and isAfterOR ? orHigh : na, "OR High", color=color.new(color.blue, 80), style=plot.style_linebr, linewidth=1)
+orLowPlot  = plot(i_showOR and orDone and isAfterOR ? orLow : na, "OR Low", color=color.new(color.blue, 80), style=plot.style_linebr, linewidth=1)
+fill(orHighPlot, orLowPlot, color=color.new(color.blue, 93), title="OR Range Fill")
+
+// Breakout levels (off by default)
+plot(i_showBreakout and orDone and isAfterOR and not na(bullLevel) ? bullLevel : na, "Bull Breakout", color=color.new(color.green, 80), style=plot.style_linebr, linewidth=1)
+plot(i_showBreakout and orDone and isAfterOR and not na(bearLevel) ? bearLevel : na, "Bear Breakout", color=color.new(color.red, 80), style=plot.style_linebr, linewidth=1)
+
+// SL / TP dashed levels — only while in trade
+inTrade = tradeEnteredToday and strategy.position_size != 0
+plot(i_showLevels and inTrade and not na(slLevel) ? slLevel : na, "SL", color=color.new(color.red, 50), style=plot.style_linebr, linewidth=1)
+plot(i_showLevels and inTrade and not na(tpLevel) ? tpLevel : na, "TP", color=color.new(color.green, 50), style=plot.style_linebr, linewidth=1)
+
+// Trailing SL — stepline, key visual
+trailColor = trailActive ? color.new(color.orange, 20) : color.new(color.red, 60)
+plot(i_showTrailLine and inTrade ? currentSLplot : na, "Trail SL", color=trailColor, style=plot.style_stepline, linewidth=2)
+
+// Entry arrows — small, no text
+plotshape(i_showArrows and justEntered and breakoutDir == 1, title="Long Entry", style=shape.triangleup, location=location.belowbar, color=color.new(color.green, 0), size=size.tiny)
+plotshape(i_showArrows and justEntered and breakoutDir == -1, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), size=size.tiny)
+
+// Exit markers — small dot
+plotshape(i_showArrows and justExited and exitDir == 1, title="Long Exit", style=shape.circle, location=location.abovebar, color=color.new(color.fuchsia, 20), size=size.tiny)
+plotshape(i_showArrows and justExited and exitDir == -1, title="Short Exit", style=shape.circle, location=location.belowbar, color=color.new(color.fuchsia, 20), size=size.tiny)
+
+// Bias label (off by default)
+var label biasLabel = na
+if i_showBias and orDone and isAfterOR and etMinOfDay == orEndMinOfDay
+    biasText = bias == 1 ? "B" : bias == -1 ? "S" : "N"
+    biasColor = bias == 1 ? color.green : bias == -1 ? color.red : color.gray
+    biasLabel := label.new(bar_index, orHigh + orHeight * 0.2, biasText, 
+                           color=color.new(biasColor, 60), textcolor=color.white, size=size.tiny, style=label.style_label_down)
+
+// Info Table (off by default)
+var table infoTable = table.new(position.top_right, 2, 5, bgcolor=color.new(color.black, 85), frame_color=color.new(color.gray, 70), frame_width=1)
+if i_showTable and barstate.islast
+    table.cell(infoTable, 0, 0, "OR H", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 0, str.tostring(orHigh, "#.##"), text_color=color.white, text_size=size.tiny)
+    table.cell(infoTable, 0, 1, "OR L", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 1, str.tostring(orLow, "#.##"), text_color=color.white, text_size=size.tiny)
+    biasStr = bias == 1 ? "BULL" : bias == -1 ? "BEAR" : "—"
+    biasClr = bias == 1 ? color.green : bias == -1 ? color.red : color.gray
+    table.cell(infoTable, 0, 2, "Bias", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 2, biasStr, text_color=biasClr, text_size=size.tiny)
+    table.cell(infoTable, 0, 3, "SL", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 3, str.tostring(slLevel, "#.##"), text_color=color.red, text_size=size.tiny)
+    table.cell(infoTable, 0, 4, "TP", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 4, str.tostring(tpLevel, "#.##"), text_color=color.green, text_size=size.tiny)
